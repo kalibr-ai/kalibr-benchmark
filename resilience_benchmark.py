@@ -2,572 +2,497 @@
 """
 Kalibr Resilience Benchmark
 
-Proves: "When your hardcoded path fails, Kalibr automatically routes to alternatives."
+Proves: When your best execution path degrades, Kalibr routes around it automatically.
+Hardcoded systems keep failing until a human intervenes.
 
-Run with:
-    python resilience_benchmark.py
-
-Requirements:
-    pip install kalibr openai
-    
-    export KALIBR_API_KEY=your-key
-    export KALIBR_TENANT_ID=your-tenant  
-    export OPENAI_API_KEY=your-key
-
-Full documentation: https://docs.kalibr.systems/benchmarks/resilience
+This benchmark uses a multi-step research agent with real tool calls (Serper, Tavily)
+to demonstrate execution path routing—not just model selection.
 """
 
 import os
 import sys
-import time
 import json
+import time
 import random
 import re
-from datetime import datetime
+import httpx
+import argparse
 from dataclasses import dataclass, field
-from typing import Optional
-from collections import defaultdict
+from typing import Optional, Dict, List, Tuple
 
+# =============================================================================
+# ENVIRONMENT
+# =============================================================================
+
+REQUIRED_ENV = [
+    "KALIBR_API_KEY",
+    "KALIBR_TENANT_ID",
+    "OPENAI_API_KEY",
+    "SERPER_API_KEY",
+    "TAVILY_API_KEY"
+]
 
 def check_environment():
-    """Verify required environment variables are set."""
-    required = ["KALIBR_API_KEY", "KALIBR_TENANT_ID", "OPENAI_API_KEY"]
-    missing = [k for k in required if not os.environ.get(k)]
+    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
     if missing:
         print(f"❌ Missing environment variables: {', '.join(missing)}")
-        print("\nGet your Kalibr credentials at: https://dashboard.kalibr.systems")
-        print("\nThen set them:")
+        print("\nThis benchmark requires:")
+        print("  - Kalibr API key and tenant ID (https://kalibr.dev)")
+        print("  - OpenAI API key")
+        print("  - Two search APIs (Serper + Tavily) to demonstrate path routing")
+        print("\nSet them with:")
         for k in missing:
             print(f"  export {k}=your-value")
         sys.exit(1)
 
-
 check_environment()
 
-from kalibr import Router
+import logging
+logging.getLogger("kalibr").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+from kalibr import register_path, decide, report_outcome
+from openai import OpenAI
+
+client = OpenAI()
+SERPER_KEY = os.environ["SERPER_API_KEY"]
+TAVILY_KEY = os.environ["TAVILY_API_KEY"]
 
 
 # =============================================================================
-# CONFIGURATION
+# EXECUTION PATHS
 # =============================================================================
 
-@dataclass
-class BenchmarkConfig:
-    """Benchmark configuration."""
-    
-    goal: str = "document_analysis"
-    
-    # Paths available to both systems
-    paths: list = field(default_factory=lambda: [
-        "gpt-4o",           # Primary - will be degraded
-        "gpt-4o-mini",      # Backup 1
-        "gpt-3.5-turbo",    # Backup 2
-    ])
-    
-    # Phase configuration
-    learning_executions: int = 30      # Phase 1: Normal operation
-    degradation_executions: int = 40   # Phase 2: Primary path degraded
-    observation_executions: int = 30   # Phase 3: Sustained degradation
-    
-    # Degradation settings
-    primary_path: str = "gpt-4o"
-    degradation_failure_rate: float = 0.7  # 70% failure rate when degraded
-    
-    # Hardcoded baseline always uses this
-    hardcoded_path: str = "gpt-4o"
+PATHS = {
+    "gpt4o-serper": {
+        "model": "gpt-4o",
+        "tool": "serper",
+        "description": "Primary path: gpt-4o + Serper"
+    },
+    "gpt4o-tavily": {
+        "model": "gpt-4o",
+        "tool": "tavily",
+        "description": "Backup tool: gpt-4o + Tavily"
+    },
+    "gpt4o-mini-tavily": {
+        "model": "gpt-4o-mini",
+        "tool": "tavily",
+        "description": "Cost-optimized: gpt-4o-mini + Tavily"
+    },
+}
+
+PATH_IDS = list(PATHS.keys())
+HARDCODED_PATH = "gpt4o-serper"
 
 
 # =============================================================================
-# TASK DEFINITION
+# FAULT INJECTION
 # =============================================================================
 
-ANALYSIS_TASK = """Analyze this document excerpt and provide:
+class FaultInjector:
+    def __init__(self):
+        self.active = False
+        self.rate = 0.0
 
-1. SUMMARY: A 2-3 sentence summary of the main point
-2. KEY_ENTITIES: List any people, organizations, or places mentioned
-3. SENTIMENT: Overall sentiment (positive/negative/neutral) with confidence
-4. ACTION_ITEMS: Any suggested next steps or actions
+    def start(self, rate: float = 0.7):
+        self.active = True
+        self.rate = rate
+        print(f"\n{'='*65}")
+        print(f"⚡ DEGRADATION STARTED: Serper failing at {rate*100:.0f}% rate")
+        print(f"{'='*65}\n")
 
-Document:
----
-{document}
----
+    def stop(self):
+        self.active = False
 
-Respond in this exact JSON format:
-{{
-  "summary": "...",
-  "key_entities": ["...", "..."],
-  "sentiment": {{"label": "...", "confidence": 0.0-1.0}},
-  "action_items": ["...", "..."]
-}}
-"""
+    def should_fail_serper(self) -> bool:
+        return self.active and random.random() < self.rate
 
-SAMPLE_DOCUMENTS = [
-    """Q3 earnings exceeded expectations with 15% YoY growth. CEO Jane Smith 
-    attributed success to the European expansion and new enterprise contracts. 
-    The board approved a $50M investment in AI infrastructure.""",
-    
-    """Customer satisfaction surveys show declining NPS scores (-12 points). 
-    Main complaints: slow response times, unclear documentation. Engineering 
-    team lead Mike Chen proposes hiring 3 additional support engineers.""",
-    
-    """Partnership agreement signed with TechCorp for joint go-to-market in 
-    APAC region. Deal worth $2.3M annually. Legal review required before 
-    public announcement. Contact: Sarah Johnson, VP Partnerships.""",
-    
-    """Security audit completed. 2 critical vulnerabilities found in 
-    authentication module. Patch deployed to staging. Production deployment 
-    scheduled for Friday 2am EST. All hands on deck required.""",
-    
-    """Product roadmap review: Q4 priorities are mobile app launch, 
-    API v2 migration, and GDPR compliance updates. Resources allocated: 
-    12 engineers, 3 designers. Deadline: November 30.""",
+FAULT = FaultInjector()
+
+
+# =============================================================================
+# SEARCH TOOLS
+# =============================================================================
+
+def search_serper(query: str) -> Tuple[bool, str, List[Dict]]:
+    if FAULT.should_fail_serper():
+        return False, "rate_limited", []
+
+    try:
+        r = httpx.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": SERPER_KEY, "Content-Type": "application/json"},
+            json={"q": query, "num": 5},
+            timeout=10.0
+        )
+        if r.status_code == 429:
+            return False, "rate_limited", []
+        if r.status_code != 200:
+            return False, f"error_{r.status_code}", []
+
+        results = [
+            {"title": x.get("title", ""), "snippet": x.get("snippet", ""), "link": x.get("link", "")}
+            for x in r.json().get("organic", [])[:5]
+        ]
+        return (True, "", results) if results else (False, "no_results", [])
+    except Exception:
+        return False, "exception", []
+
+
+def search_tavily(query: str) -> Tuple[bool, str, List[Dict]]:
+    try:
+        r = httpx.post(
+            "https://api.tavily.com/search",
+            json={"api_key": TAVILY_KEY, "query": query, "max_results": 5},
+            timeout=15.0
+        )
+        if r.status_code != 200:
+            return False, f"error_{r.status_code}", []
+
+        results = [
+            {"title": x.get("title", ""), "snippet": x.get("content", "")[:300], "link": x.get("url", "")}
+            for x in r.json().get("results", [])[:5]
+        ]
+        return (True, "", results) if results else (False, "no_results", [])
+    except Exception:
+        return False, "exception", []
+
+
+def search(tool: str, query: str) -> Tuple[bool, str, List[Dict]]:
+    if tool == "serper":
+        return search_serper(query)
+    elif tool == "tavily":
+        return search_tavily(query)
+    return False, "unknown_tool", []
+
+
+# =============================================================================
+# RESEARCH AGENT
+# =============================================================================
+
+QUESTIONS = [
+    "What are the key differences between Series A and Series B funding?",
+    "How does Stripe's payment processing work?",
+    "What is AWS vs Azure market share?",
+    "What are the main GDPR requirements?",
+    "How does Y Combinator work?",
+    "What is the average SF engineer salary?",
+    "Microservices vs monolith pros and cons?",
+    "How does Shopify make money?",
+    "What are key SaaS metrics?",
+    "SOC 2 Type 1 vs Type 2 difference?",
 ]
 
-
-def get_random_document() -> str:
-    return random.choice(SAMPLE_DOCUMENTS)
-
-
-def validate_response(response_text: str) -> tuple[bool, str]:
-    """Validate the LLM response. Returns (success, reason)."""
-    if not response_text or not response_text.strip():
-        return False, "empty_response"
-    
-    try:
-        # Strip markdown code blocks if present
-        text = response_text.strip()
-        if text.startswith("```"):
-            text = re.sub(r'^```(?:json)?\s*\n?', '', text)
-            text = re.sub(r'\n?```\s*$', '', text)
-        
-        data = json.loads(text)
-        
-        # Check required fields
-        required = ["summary", "key_entities", "sentiment", "action_items"]
-        for field in required:
-            if field not in data:
-                return False, f"missing_field_{field}"
-        
-        if not isinstance(data["summary"], str) or len(data["summary"]) < 20:
-            return False, "invalid_summary"
-        
-        if not isinstance(data["key_entities"], list):
-            return False, "invalid_entities"
-        
-        if not isinstance(data["sentiment"], dict):
-            return False, "invalid_sentiment"
-        if "label" not in data["sentiment"] or "confidence" not in data["sentiment"]:
-            return False, "incomplete_sentiment"
-        
-        if not isinstance(data["action_items"], list):
-            return False, "invalid_action_items"
-        
-        return True, "valid"
-        
-    except json.JSONDecodeError:
-        return False, "json_parse_error"
-    except Exception as e:
-        return False, f"validation_error_{type(e).__name__}"
-
-
-# =============================================================================
-# DEGRADATION INJECTION
-# =============================================================================
-
-class DegradationController:
-    """Controls failure injection to simulate provider degradation."""
-    
-    def __init__(self, config: BenchmarkConfig):
-        self.config = config
-        self.degradation_active = False
-        self.degradation_start_time: Optional[datetime] = None
-    
-    def activate_degradation(self):
-        self.degradation_active = True
-        self.degradation_start_time = datetime.now()
-        print(f"\n🔥 DEGRADATION ACTIVATED at {self.degradation_start_time.strftime('%H:%M:%S')}")
-        print(f"   Primary path ({self.config.primary_path}) now failing at {self.config.degradation_failure_rate*100:.0f}% rate")
-    
-    def should_fail(self, model_id: str) -> bool:
-        if not self.degradation_active:
-            return False
-        if model_id != self.config.primary_path:
-            return False
-        return random.random() < self.config.degradation_failure_rate
-    
-    def inject_failure(self) -> str:
-        failure_types = [
-            "",
-            "Error: Service temporarily unavailable",
-            '{"error": "rate_limit_exceeded"}',
-            "I apologize, but I cannot process this request at the moment.",
-            '{"summary": "", "key_entities": [], "sentiment": {}, "action_items": []}',
-        ]
-        return random.choice(failure_types)
-
-
-# =============================================================================
-# METRICS
-# =============================================================================
-
-# Model costs per 1M tokens (input, output)
 MODEL_COSTS = {
     "gpt-4o": (2.50, 10.00),
-    "gpt-4o-2024-08-06": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4o-mini-2024-07-18": (0.15, 0.60),
-    "gpt-3.5-turbo": (0.50, 1.50),
-    "gpt-3.5-turbo-0125": (0.50, 1.50),
 }
 
 
-def estimate_cost(model: str, input_tokens: int = 500, output_tokens: int = 300) -> float:
-    base_model = model.split("-2024")[0] if "-2024" in model else model
-    costs = MODEL_COSTS.get(model, MODEL_COSTS.get(base_model, (1.0, 1.0)))
-    return (input_tokens * costs[0] + output_tokens * costs[1]) / 1_000_000
+def llm_call(model: str, prompt: str, max_tokens: int = 500) -> Tuple[str, float, bool]:
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0.2
+        )
+        content = response.choices[0].message.content
+        costs = MODEL_COSTS.get(model, (1, 1))
+        cost = (response.usage.prompt_tokens * costs[0] + response.usage.completion_tokens * costs[1]) / 1_000_000
+        return content, cost, True
+    except Exception:
+        return "", 0, False
 
+
+def parse_json(text: str) -> Optional[dict]:
+    if "```" in text:
+        match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+        if match:
+            text = match.group(1)
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def run_agent(path_id: str, question: str) -> Tuple[bool, str, float]:
+    path = PATHS[path_id]
+    model = path["model"]
+    tool = path["tool"]
+    total_cost = 0.0
+
+    # Step 1: PLAN
+    prompt = f'Generate 2 search queries for: {question}\nReturn JSON: {{"queries": ["q1", "q2"]}}'
+    content, cost, ok = llm_call(model, prompt, 150)
+    total_cost += cost
+    if not ok:
+        return False, "plan_llm_fail", total_cost
+    data = parse_json(content)
+    if not data or "queries" not in data:
+        return False, "plan_bad_json", total_cost
+    queries = data["queries"][:2]
+
+    # Step 2: SEARCH
+    all_results = []
+    for q in queries:
+        ok, err, results = search(tool, q)
+        if not ok and not all_results:
+            return False, f"search_{err}", total_cost
+        all_results.extend(results)
+    if not all_results:
+        return False, "search_empty", total_cost
+    results = all_results[:6]
+
+    # Step 3: EXTRACT
+    sources_text = "\n".join([f"[{i+1}] {r['title']}: {r['snippet'][:100]}" for i, r in enumerate(results)])
+    prompt = f'Extract facts from sources for: {question}\n\nSources:\n{sources_text}\n\nReturn JSON: {{"facts": [{{"fact": "...", "source": 1}}]}}'
+    content, cost, ok = llm_call(model, prompt, 400)
+    total_cost += cost
+    if not ok:
+        return False, "extract_llm_fail", total_cost
+    data = parse_json(content)
+    if not data or not data.get("facts"):
+        return False, "extract_bad_json", total_cost
+    facts = data["facts"]
+
+    # Step 4: SYNTHESIZE
+    facts_text = "\n".join([f"- {f.get('fact', str(f))} [Source {f.get('source', '?')}]" for f in facts[:5]])
+    prompt = f'''Answer this question using the facts below.
+
+Question: {question}
+
+Facts:
+{facts_text}
+
+IMPORTANT: Your answer MUST include citation numbers like [1], [2] after each claim.
+
+Return JSON: {{"answer": "Your 2 paragraph answer with citations like [1], [2]."}}'''
+    content, cost, ok = llm_call(model, prompt, 500)
+    total_cost += cost
+    if not ok:
+        return False, "synth_llm_fail", total_cost
+    data = parse_json(content)
+    if not data or not data.get("answer"):
+        return False, "synth_bad_json", total_cost
+    answer = data["answer"]
+
+    # Step 5: VALIDATE
+    citations = [int(m) for m in re.findall(r'\[(\d+)\]', answer)]
+    if not citations:
+        return False, "validate_no_citations", total_cost
+    invalid = [c for c in citations if c < 1 or c > len(results)]
+    if invalid:
+        return False, "validate_bad_index", total_cost
+
+    return True, "success", total_cost
+
+
+# =============================================================================
+# STATISTICS
+# =============================================================================
 
 @dataclass
-class ExecutionResult:
-    execution_id: int
-    phase: str
-    system: str
-    model_used: str
-    success: bool
-    failure_reason: Optional[str]
-    latency_ms: int
-    cost_usd: float
-    timestamp: datetime
+class Stats:
+    attempts: int = 0
+    successes: int = 0
+    cost: float = 0.0
+    failures: Dict[str, int] = field(default_factory=dict)
 
+    def record(self, success: bool, cost: float, reason: str = ""):
+        self.attempts += 1
+        self.cost += cost
+        if success:
+            self.successes += 1
+        elif reason:
+            self.failures[reason] = self.failures.get(reason, 0) + 1
 
-class MetricsTracker:
-    def __init__(self):
-        self.results: list[ExecutionResult] = []
-        self.routing_distribution: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    
-    def record(self, result: ExecutionResult):
-        self.results.append(result)
-        self.routing_distribution[result.phase][result.model_used] += 1
-    
-    def get_success_rate(self, system: str, phase: str) -> float:
-        phase_results = [r for r in self.results if r.system == system and r.phase == phase]
-        if not phase_results:
-            return 0.0
-        return sum(1 for r in phase_results if r.success) / len(phase_results)
-    
-    def get_phase_summary(self, phase: str) -> dict:
-        kalibr_results = [r for r in self.results if r.system == "kalibr" and r.phase == phase]
-        hardcoded_results = [r for r in self.results if r.system == "hardcoded" and r.phase == phase]
-        
-        k_total_cost = sum(r.cost_usd for r in kalibr_results)
-        k_successes = sum(1 for r in kalibr_results if r.success)
-        h_total_cost = sum(r.cost_usd for r in hardcoded_results)
-        h_successes = sum(1 for r in hardcoded_results if r.success)
-        
-        return {
-            "kalibr": {
-                "total": len(kalibr_results),
-                "successes": k_successes,
-                "failures": sum(1 for r in kalibr_results if not r.success),
-                "success_rate": self.get_success_rate("kalibr", phase),
-                "models_used": dict(self.routing_distribution[f"{phase}_kalibr"]),
-                "total_cost": k_total_cost,
-                "cost_per_success": k_total_cost / k_successes if k_successes > 0 else float('inf'),
-            },
-            "hardcoded": {
-                "total": len(hardcoded_results),
-                "successes": h_successes,
-                "failures": sum(1 for r in hardcoded_results if not r.success),
-                "success_rate": self.get_success_rate("hardcoded", phase),
-                "total_cost": h_total_cost,
-                "cost_per_success": h_total_cost / h_successes if h_successes > 0 else float('inf'),
-            }
-        }
-    
-    def print_live_status(self, execution_id: int, phase: str, kalibr_result: ExecutionResult, hardcoded_result: ExecutionResult):
-        k_status = "✓" if kalibr_result.success else "✗"
-        h_status = "✓" if hardcoded_result.success else "✗"
-        k_color = "\033[92m" if kalibr_result.success else "\033[91m"
-        h_color = "\033[92m" if hardcoded_result.success else "\033[91m"
-        reset = "\033[0m"
-        print(f"  [{execution_id:3d}] Kalibr: {k_color}{k_status}{reset} ({kalibr_result.model_used:15s}) | Hardcoded: {h_color}{h_status}{reset} ({hardcoded_result.model_used})")
+    @property
+    def success_rate(self) -> float:
+        return self.successes / self.attempts if self.attempts else 0
 
 
 # =============================================================================
-# AGENT
+# BENCHMARK
 # =============================================================================
 
-class DocumentAnalysisAgent:
-    def __init__(self, config: BenchmarkConfig, degradation: DegradationController):
-        self.config = config
-        self.degradation = degradation
-        self.router = Router(goal=config.goal, paths=config.paths)
-        self.hardcoded_router = Router(goal=f"{config.goal}_hardcoded", paths=[config.hardcoded_path])
-    
-    def execute_kalibr(self, document: str) -> tuple[bool, str, str, bool, float]:
-        messages = [
-            {"role": "system", "content": "You are a document analysis assistant. Always respond in valid JSON."},
-            {"role": "user", "content": ANALYSIS_TASK.format(document=document)},
-        ]
-        
-        try:
-            response = self.router.completion(messages=messages)
-            model_used = response.model
-            content = response.choices[0].message.content
-            
-            cost = estimate_cost(
-                model_used,
-                getattr(response.usage, 'prompt_tokens', 500),
-                getattr(response.usage, 'completion_tokens', 300)
-            )
-            
-            was_primary = model_used == self.config.primary_path
-            
-            if self.degradation.should_fail(model_used):
-                content = self.degradation.inject_failure()
-            
-            success, reason = validate_response(content)
-            self.router.report(success=success, reason=None if success else reason)
-            
-            return success, reason if not success else None, model_used, was_primary, cost
-            
-        except Exception as e:
-            return False, f"exception_{type(e).__name__}", self.config.primary_path, True, 0.0
-    
-    def execute_hardcoded(self, document: str) -> tuple[bool, str, str, bool, float]:
-        messages = [
-            {"role": "system", "content": "You are a document analysis assistant. Always respond in valid JSON."},
-            {"role": "user", "content": ANALYSIS_TASK.format(document=document)},
-        ]
-        
-        model_used = self.config.hardcoded_path
-        
-        try:
-            response = self.hardcoded_router.completion(messages=messages, force_model=model_used)
-            content = response.choices[0].message.content
-            
-            cost = estimate_cost(
-                model_used,
-                getattr(response.usage, 'prompt_tokens', 500),
-                getattr(response.usage, 'completion_tokens', 300)
-            )
-            
-            if self.degradation.should_fail(model_used):
-                content = self.degradation.inject_failure()
-            
-            success, reason = validate_response(content)
-            self.hardcoded_router.report(success=success, reason=None if success else reason)
-            
-            return success, reason if not success else None, model_used, True, cost
-            
-        except Exception as e:
-            return False, f"exception_{type(e).__name__}", model_used, True, 0.0
+def run_benchmark(learning: int = 15, degraded: int = 25, recovery: int = 10):
+    total = learning + degraded + recovery
 
-
-# =============================================================================
-# BENCHMARK RUNNER
-# =============================================================================
-
-def run_benchmark(config: BenchmarkConfig):
-    print("=" * 70)
+    print("=" * 65)
     print("KALIBR RESILIENCE BENCHMARK")
-    print("=" * 70)
-    print(f"\nGoal: Prove Kalibr routes around failures automatically")
-    print(f"Primary path: {config.primary_path}")
-    print(f"Backup paths: {[p for p in config.paths if p != config.primary_path]}")
-    print(f"\nPhases:")
-    print(f"  1. Learning:     {config.learning_executions} executions (normal operation)")
-    print(f"  2. Degradation:  {config.degradation_executions} executions ({config.primary_path} fails at {config.degradation_failure_rate*100:.0f}%)")
-    print(f"  3. Observation:  {config.observation_executions} executions (sustained degradation)")
-    print("=" * 70)
-    
-    degradation = DegradationController(config)
-    metrics = MetricsTracker()
-    agent = DocumentAnalysisAgent(config, degradation)
-    
-    execution_id = 0
-    
-    # Phase 1: Learning
-    print(f"\n📚 PHASE 1: LEARNING ({config.learning_executions} executions)")
-    print("-" * 50)
-    
-    for i in range(config.learning_executions):
-        execution_id += 1
-        document = get_random_document()
-        
-        start = time.time()
-        k_success, k_reason, k_model, _, k_cost = agent.execute_kalibr(document)
-        k_latency = int((time.time() - start) * 1000)
-        
-        start = time.time()
-        h_success, h_reason, h_model, _, h_cost = agent.execute_hardcoded(document)
-        h_latency = int((time.time() - start) * 1000)
-        
-        k_result = ExecutionResult(execution_id, "learning", "kalibr", k_model, k_success, k_reason, k_latency, k_cost, datetime.now())
-        h_result = ExecutionResult(execution_id, "learning", "hardcoded", h_model, h_success, h_reason, h_latency, h_cost, datetime.now())
-        
-        metrics.record(k_result)
-        metrics.record(h_result)
-        metrics.routing_distribution["learning_kalibr"][k_model] += 1
-        metrics.print_live_status(execution_id, "learning", k_result, h_result)
-        
-        time.sleep(0.5)
-    
-    summary = metrics.get_phase_summary("learning")
-    print(f"\n  Learning complete:")
-    print(f"    Kalibr:    {summary['kalibr']['success_rate']*100:.1f}% success ({summary['kalibr']['successes']}/{summary['kalibr']['total']})")
-    print(f"    Hardcoded: {summary['hardcoded']['success_rate']*100:.1f}% success ({summary['hardcoded']['successes']}/{summary['hardcoded']['total']})")
-    
-    # Phase 2: Degradation
-    print(f"\n🔥 PHASE 2: DEGRADATION ({config.degradation_executions} executions)")
-    print("-" * 50)
-    
-    degradation.activate_degradation()
-    
-    for i in range(config.degradation_executions):
-        execution_id += 1
-        document = get_random_document()
-        
-        start = time.time()
-        k_success, k_reason, k_model, _, k_cost = agent.execute_kalibr(document)
-        k_latency = int((time.time() - start) * 1000)
-        
-        start = time.time()
-        h_success, h_reason, h_model, _, h_cost = agent.execute_hardcoded(document)
-        h_latency = int((time.time() - start) * 1000)
-        
-        k_result = ExecutionResult(execution_id, "degradation", "kalibr", k_model, k_success, k_reason, k_latency, k_cost, datetime.now())
-        h_result = ExecutionResult(execution_id, "degradation", "hardcoded", h_model, h_success, h_reason, h_latency, h_cost, datetime.now())
-        
-        metrics.record(k_result)
-        metrics.record(h_result)
-        metrics.routing_distribution["degradation_kalibr"][k_model] += 1
-        metrics.print_live_status(execution_id, "degradation", k_result, h_result)
-        
-        time.sleep(0.5)
-    
-    summary = metrics.get_phase_summary("degradation")
-    print(f"\n  Degradation phase complete:")
-    print(f"    Kalibr:    {summary['kalibr']['success_rate']*100:.1f}% success ({summary['kalibr']['successes']}/{summary['kalibr']['total']})")
-    print(f"    Hardcoded: {summary['hardcoded']['success_rate']*100:.1f}% success ({summary['hardcoded']['successes']}/{summary['hardcoded']['total']})")
-    
-    # Phase 3: Observation
-    print(f"\n👁️ PHASE 3: OBSERVATION ({config.observation_executions} executions)")
-    print("-" * 50)
-    
-    for i in range(config.observation_executions):
-        execution_id += 1
-        document = get_random_document()
-        
-        start = time.time()
-        k_success, k_reason, k_model, _, k_cost = agent.execute_kalibr(document)
-        k_latency = int((time.time() - start) * 1000)
-        
-        start = time.time()
-        h_success, h_reason, h_model, _, h_cost = agent.execute_hardcoded(document)
-        h_latency = int((time.time() - start) * 1000)
-        
-        k_result = ExecutionResult(execution_id, "observation", "kalibr", k_model, k_success, k_reason, k_latency, k_cost, datetime.now())
-        h_result = ExecutionResult(execution_id, "observation", "hardcoded", h_model, h_success, h_reason, h_latency, h_cost, datetime.now())
-        
-        metrics.record(k_result)
-        metrics.record(h_result)
-        metrics.routing_distribution["observation_kalibr"][k_model] += 1
-        metrics.print_live_status(execution_id, "observation", k_result, h_result)
-        
-        time.sleep(0.5)
-    
-    # Final Report
-    print("\n" + "=" * 70)
-    print("FINAL RESULTS")
-    print("=" * 70)
-    
-    total_kalibr = [r for r in metrics.results if r.system == "kalibr"]
-    total_hardcoded = [r for r in metrics.results if r.system == "hardcoded"]
-    
-    kalibr_overall = sum(1 for r in total_kalibr if r.success) / len(total_kalibr)
-    hardcoded_overall = sum(1 for r in total_hardcoded if r.success) / len(total_hardcoded)
-    
-    learning = metrics.get_phase_summary("learning")
-    degradation_summary = metrics.get_phase_summary("degradation")
-    observation = metrics.get_phase_summary("observation")
-    
-    print(f"\n📊 SUCCESS RATES BY PHASE")
-    print("-" * 50)
-    print(f"{'Phase':<15} {'Kalibr':<20} {'Hardcoded':<20}")
-    print(f"{'Learning':<15} {learning['kalibr']['success_rate']*100:>6.1f}%             {learning['hardcoded']['success_rate']*100:>6.1f}%")
-    print(f"{'Degradation':<15} {degradation_summary['kalibr']['success_rate']*100:>6.1f}%             {degradation_summary['hardcoded']['success_rate']*100:>6.1f}%")
-    print(f"{'Observation':<15} {observation['kalibr']['success_rate']*100:>6.1f}%             {observation['hardcoded']['success_rate']*100:>6.1f}%")
-    print("-" * 50)
-    print(f"{'OVERALL':<15} {kalibr_overall*100:>6.1f}%             {hardcoded_overall*100:>6.1f}%")
-    
-    # Cost analysis
-    k_total_cost = sum(r.cost_usd for r in total_kalibr)
-    h_total_cost = sum(r.cost_usd for r in total_hardcoded)
-    k_successes = sum(1 for r in total_kalibr if r.success)
-    h_successes = sum(1 for r in total_hardcoded if r.success)
-    
-    print(f"\n💰 COST ANALYSIS")
-    print("-" * 50)
-    print(f"{'Metric':<25} {'Kalibr':<15} {'Hardcoded':<15}")
-    print(f"{'Total Cost':<25} ${k_total_cost:<14.4f} ${h_total_cost:<14.4f}")
-    print(f"{'Successful Outcomes':<25} {k_successes:<15} {h_successes:<15}")
-    if k_successes > 0 and h_successes > 0:
-        k_cps = k_total_cost / k_successes
-        h_cps = h_total_cost / h_successes
-        print(f"{'Cost per Success':<25} ${k_cps:<14.6f} ${h_cps:<14.6f}")
-    
-    print(f"\n🔀 KALIBR ROUTING DISTRIBUTION")
-    print("-" * 50)
-    for phase in ["learning", "degradation", "observation"]:
-        dist = dict(metrics.routing_distribution[f"{phase}_kalibr"])
-        total = sum(dist.values())
-        print(f"{phase.capitalize():15} ", end="")
-        for model, count in sorted(dist.items()):
-            pct = count / total * 100 if total > 0 else 0
-            print(f"{model}: {pct:.0f}%  ", end="")
-        print()
-    
-    # The proof
-    print(f"\n" + "=" * 70)
-    print("📋 THE PROOF")
-    print("=" * 70)
-    
-    degradation_delta = degradation_summary['kalibr']['success_rate'] - degradation_summary['hardcoded']['success_rate']
-    
+    print("=" * 65)
     print(f"""
-During degradation (when {config.primary_path} was failing at {config.degradation_failure_rate*100:.0f}%):
+Claim: Kalibr routes around degraded execution paths automatically.
 
-  • Hardcoded system: {degradation_summary['hardcoded']['success_rate']*100:.1f}% success
-    → Kept sending traffic to broken path
-    → Required human intervention to fix
-    
-  • Kalibr system: {degradation_summary['kalibr']['success_rate']*100:.1f}% success  
-    → Detected degradation automatically
-    → Routed traffic to healthy alternatives
-    → No human intervention required
+Agent: Multi-step research analyst
+  1. Plan    → Generate search queries (LLM)
+  2. Search  → Call external API (Serper or Tavily)
+  3. Extract → Pull facts with sources (LLM)
+  4. Synth   → Write cited answer (LLM)
+  5. Validate → Verify citations exist
 
-Kalibr maintained {degradation_delta*100:+.1f} percentage points higher success rate
-during the outage.
+Execution Paths:
+  • gpt4o-serper      - Primary (HARDCODED BASELINE)
+  • gpt4o-tavily      - Backup tool
+  • gpt4o-mini-tavily - Cost-optimized backup
+
+Phases:
+  1. Learning ({learning:2d} tasks) - Normal operation
+  2. Degraded ({degraded:2d} tasks) - Serper fails 70%
+  3. Recovery ({recovery:2d} tasks) - Measure adaptation
+
+Hardcoded always uses: gpt4o-serper
+Kalibr chooses dynamically from all 3 paths.
 """)
-    
-    print("=" * 70)
+    print("=" * 65)
+
+    import uuid
+    goal = f"benchmark_{uuid.uuid4().hex[:8]}"
+
+    for path_id in PATH_IDS:
+        try:
+            register_path(goal=goal, model_id=path_id)
+        except Exception:
+            pass
+
+    print(f"Goal ID: {goal}")
+    print("-" * 65)
+
+    hardcoded = {"learning": Stats(), "degraded": Stats(), "recovery": Stats()}
+    kalibr = {"learning": Stats(), "degraded": Stats(), "recovery": Stats()}
+    kalibr_by_path = {pid: Stats() for pid in PATH_IDS}
+
+    for i in range(total):
+        if i < learning:
+            phase = "learning"
+        elif i < learning + degraded:
+            phase = "degraded"
+            if i == learning:
+                FAULT.start(0.7)
+        else:
+            phase = "recovery"
+
+        question = QUESTIONS[i % len(QUESTIONS)]
+
+        h_ok, h_reason, h_cost = run_agent(HARDCODED_PATH, question)
+        hardcoded[phase].record(h_ok, h_cost, h_reason)
+
+        try:
+            decision = decide(goal=goal)
+            k_path_id = decision.get("model_id", PATH_IDS[0])
+            trace_id = decision.get("trace_id", "")
+            if k_path_id not in PATHS:
+                k_path_id = PATH_IDS[0]
+        except Exception:
+            k_path_id = PATH_IDS[0]
+            trace_id = ""
+
+        k_ok, k_reason, k_cost = run_agent(k_path_id, question)
+
+        try:
+            report_outcome(
+                trace_id=trace_id,
+                goal=goal,
+                success=k_ok,
+                failure_reason=None if k_ok else k_reason,
+                model_id=k_path_id
+            )
+        except Exception:
+            pass
+
+        kalibr[phase].record(k_ok, k_cost, k_reason)
+        kalibr_by_path[k_path_id].record(k_ok, k_cost, k_reason)
+
+        h_rate = hardcoded[phase].success_rate * 100
+        k_rate = kalibr[phase].success_rate * 100
+        h_mark = "✓" if h_ok else "✗"
+        k_mark = "✓" if k_ok else "✗"
+        h_err = "" if h_ok else f" ({h_reason[:18]})"
+        k_err = "" if k_ok else f" ({k_reason[:18]})"
+
+        print(f"  [{i+1:2d}/{total}] {phase:8s} | H:{h_rate:5.1f}% {h_mark}{h_err:20s} | K:{k_rate:5.1f}% {k_mark}{k_err:20s} | {k_path_id}")
+
+        time.sleep(0.3)
+
+    FAULT.stop()
+
+    print("\n" + "=" * 65)
+    print("RESULTS")
+    print("=" * 65)
+
+    print(f"\n{'Phase':<12} {'Hardcoded':>12} {'Kalibr':>12} {'Delta':>12}")
+    print("-" * 50)
+    for phase in ["learning", "degraded", "recovery"]:
+        h_rate = hardcoded[phase].success_rate * 100
+        k_rate = kalibr[phase].success_rate * 100
+        delta = k_rate - h_rate
+        print(f"{phase:<12} {h_rate:>10.1f}% {k_rate:>10.1f}% {delta:>+10.1f}%")
+
+    h_total = sum(s.successes for s in hardcoded.values()) / sum(s.attempts for s in hardcoded.values()) * 100
+    k_total = sum(s.successes for s in kalibr.values()) / sum(s.attempts for s in kalibr.values()) * 100
+    print("-" * 50)
+    print(f"{'OVERALL':<12} {h_total:>10.1f}% {k_total:>10.1f}% {k_total-h_total:>+10.1f}%")
+
+    print(f"\n📊 KALIBR PATH DISTRIBUTION")
+    print("-" * 45)
+    for pid in PATH_IDS:
+        stats = kalibr_by_path[pid]
+        if stats.attempts:
+            print(f"  {pid:<20} {stats.attempts:>3} tasks | {stats.success_rate*100:>5.1f}% success")
+
+    print("\n" + "=" * 65)
+
+    h_deg = hardcoded["degraded"].success_rate
+    k_deg = kalibr["degraded"].success_rate
+
+    if k_deg > h_deg + 0.2:
+        print(f"""
+✅ PROOF: KALIBR ROUTES AROUND FAILURES
+
+During Serper degradation (70% failure rate):
+  Hardcoded: {h_deg*100:>5.1f}% success (kept failing)
+  Kalibr:    {k_deg*100:>5.1f}% success (routed to healthy paths)
+
+Kalibr preserved success when the best static path failed.
+No code change. No human intervention. Automatic.
+""")
+    elif k_deg > h_deg + 0.05:
+        print(f"""
+📈 KALIBR SHOWED IMPROVEMENT
+
+During degradation: Hardcoded {h_deg*100:.1f}% → Kalibr {k_deg*100:.1f}%
+
+Improvement visible. Run with more tasks for stronger signal.
+""")
+    else:
+        print(f"""
+⚠️ INCONCLUSIVE
+
+Degraded phase: Hardcoded {h_deg*100:.1f}% vs Kalibr {k_deg*100:.1f}%
+
+Check path distribution to verify routing is working.
+""")
+
+    print("=" * 65)
 
 
 if __name__ == "__main__":
-    config = BenchmarkConfig()
-    
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--quick":
-            config.learning_executions = 10
-            config.degradation_executions = 15
-            config.observation_executions = 10
-            print("Running quick benchmark (~35 executions)")
-        elif sys.argv[1] == "--full":
-            config.learning_executions = 50
-            config.degradation_executions = 100
-            config.observation_executions = 50
-            print("Running full benchmark (~200 executions)")
-    
-    run_benchmark(config)
+    parser = argparse.ArgumentParser(description="Kalibr Resilience Benchmark")
+    parser.add_argument("--quick", action="store_true", help="Quick test with fewer tasks")
+    parser.add_argument("--full", action="store_true", help="Full benchmark with more tasks")
+    parser.add_argument("--learning", type=int, default=15)
+    parser.add_argument("--degraded", type=int, default=25)
+    parser.add_argument("--recovery", type=int, default=10)
+
+    args = parser.parse_args()
+
+    if args.quick:
+        run_benchmark(learning=8, degraded=12, recovery=5)
+    elif args.full:
+        run_benchmark(learning=30, degraded=50, recovery=20)
+    else:
+        run_benchmark(args.learning, args.degraded, args.recovery)
